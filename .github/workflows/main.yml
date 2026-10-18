@@ -1,0 +1,411 @@
+name: Build IPA v16
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - name: 1 检出代码
+        uses: actions/checkout@v4
+
+      - name: 2 环境自检
+        run: |
+          set -e
+          sw_vers
+          xcodebuild -version
+          echo "---- 仓库内容 ----"
+          ls -la
+
+      - name: 3 找 v16 源码
+        id: locate
+        run: |
+          set -eu
+
+          echo "==== 只认 v16，别的一概不碰 ===="
+          BEST=""
+
+          ZIPS=$(ls -1 *.zip 2>/dev/null | grep -iE 'v16\.[0-9]+' | sort -rV || true)
+          for z in $ZIPS; do
+            [ -f "$z" ] || continue
+            echo "---- 试探压缩包：$z ----"
+            rm -rf _v16src
+            mkdir -p _v16src
+            if python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$z" _v16src 2>/dev/null; then
+              echo "解压方式：python zipfile ✅"
+            else
+              unzip -oq "$z" -d _v16src || { echo "跳过（不是有效压缩包）"; rm -rf _v16src; continue; }
+              echo "解压方式：unzip ✅"
+            fi
+            P=$(find _v16src -maxdepth 5 -name project.yml | head -n 1 || true)
+            if [ -z "${P:-}" ]; then
+              echo "跳过（里面没有工程）"
+              rm -rf _v16src
+              continue
+            fi
+            D=$(dirname "$P")
+            if grep -q 'CFBundleShortVersionString: "16\.3' "$D/project.yml"; then
+              BEST="$D"
+              echo "命中压缩包：$z → $D"
+              break
+            fi
+            echo "跳过（不是 v16.3 的包）"
+            rm -rf _v16src
+          done
+
+          if [ -z "$BEST" ]; then
+            DIRS=$(ls -1d LSPakManager-Source-v16.3*/ 2>/dev/null | sed 's:/$::' | sort -rV || true)
+            for d in $DIRS . ; do
+              if [ -f "$d/project.yml" ] && [ -d "$d/Sources" ]; then
+                if grep -q 'CFBundleShortVersionString: "16\.3' "$d/project.yml"; then
+                  BEST="$d"
+                  echo "命中文件夹：$d"
+                  break
+                fi
+              fi
+            done
+          fi
+
+          if [ -z "$BEST" ]; then
+            echo "::error::仓库里没找到 v16 源码"
+            ls -la *.zip 2>/dev/null || true
+            {
+              echo "## ⛔ 没找到 v16 源码"
+              echo ""
+              echo "把 \`LSPakManager-Source-v16.3.zip\` 原样传到仓库根目录（别解压、别改名），再点 Run workflow。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "======================================"
+          echo "选中源码 = $BEST"
+          ls -la "$BEST/Sources"
+          echo "======================================"
+          echo "root=$BEST" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 🔎 本次源码"
+            echo ""
+            echo "- 版本：**16.3**"
+            echo "- 目录：\`$BEST\`"
+            echo ""
+            echo "下面出现「✅ ipa 直链」才说明编译成功。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 4 准备 XcodeGen
+        run: |
+          set -eu
+          if command -v xcodegen >/dev/null 2>&1; then
+            echo "系统自带: $(xcodegen --version)"
+            exit 0
+          fi
+          mkdir -p "$HOME/xg"
+          curl -L --fail --retry 3 -o /tmp/xg.zip https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+          unzip -q -o /tmp/xg.zip -d "$HOME/xg"
+          BIN=$(find "$HOME/xg" -type f -name xcodegen -perm -u+x | head -n 1 || true)
+          if [ -z "$BIN" ]; then
+            BIN=$(find "$HOME/xg" -type f -name xcodegen | head -n 1 || true)
+          fi
+          chmod +x "$BIN"
+          dirname "$BIN" >> "$GITHUB_PATH"
+          echo "装好了: $("$BIN" --version)"
+
+      - name: 5 源码自检
+        env:
+          SRC_ROOT: ${{ steps.locate.outputs.root }}
+        run: |
+          set -eu
+          cd "$SRC_ROOT"
+
+          echo "---- 文件齐不齐 ----"
+          for f in Sources/LSApp.swift Sources/ContentView.swift Sources/Store.swift \
+                   Sources/DirectBridge.swift Sources/FilzaLink.swift Sources/LSPaths.swift \
+                   Sources/Models.swift Sources/Appearance.swift Sources/Compatibility.swift \
+                   Sources/PathMemory.swift ; do
+            if [ ! -f "$f" ]; then
+              echo "::error::缺 $f，源码包不完整"
+              exit 1
+            fi
+          done
+          echo "文件齐 ✅"
+
+          echo "---- 网络桥接层必须已经拿掉 ----"
+          if [ -f Sources/FilzaBridge.swift ]; then
+            echo "::error::FilzaBridge.swift 还在（拿到的是 v15 旧包）。换成 v16.3 的 zip"
+            exit 1
+          fi
+          if [ -f Sources/DirPicker.swift ]; then
+            echo "::error::DirPicker.swift 还在（拿到的是 v15 旧包）。换成 v16.3 的 zip"
+            exit 1
+          fi
+          if grep -q "PROPFIND" Sources/*.swift ; then
+            echo "::error::源码里还有 WebDAV 的 PROPFIND（旧包）"
+            exit 1
+          fi
+          echo "网络层已清空 ✅"
+
+          echo "---- 直连引擎 ----"
+          grep -q "containersRoot" Sources/DirectBridge.swift || { echo "::error::没有容器根路径"; exit 1; }
+          grep -q "ShadowTrackerExtra" Sources/DirectBridge.swift || { echo "::error::认游戏目录的特征串丢了"; exit 1; }
+          grep -q "func locateGame" Sources/DirectBridge.swift || { echo "::error::没有 locateGame"; exit 1; }
+          grep -q "func overwrite" Sources/DirectBridge.swift || { echo "::error::没有覆盖写入"; exit 1; }
+          grep -q "func moveOut" Sources/DirectBridge.swift || { echo "::error::没有移出"; exit 1; }
+          grep -q "withUnsafeFileSystemRepresentation" Sources/DirectBridge.swift || { echo "::error::没有 rename 原子替换"; exit 1; }
+          grep -q "struct BridgeFailure: Error" Sources/DirectBridge.swift || { echo "::error::BridgeFailure 定义丢了"; exit 1; }
+          echo "直连引擎 ✅"
+
+          echo "---- 深链通道（不联网）----"
+          grep -q "filza://" Sources/FilzaLink.swift || { echo "::error::没有 Filza 深链"; exit 1; }
+          if grep -q "http://" Sources/FilzaLink.swift ; then echo "::error::FilzaLink 里出现了 http，说明不是这一版"; exit 1; fi
+          echo "深链 ✅"
+
+          echo "---- 业务层 ----"
+          grep -q "func importAll" Sources/Store.swift || { echo "::error::没有 importAll"; exit 1; }
+          grep -q "func directImport" Sources/Store.swift || { echo "::error::没有 directImport"; exit 1; }
+          grep -q "func exportImported" Sources/Store.swift || { echo "::error::没有 exportImported"; exit 1; }
+          grep -q "func detectEngine" Sources/Store.swift || { echo "::error::没有模式判断"; exit 1; }
+          grep -q "func openInboxInFilza" Sources/Store.swift || { echo "::error::没有深链入口"; exit 1; }
+          echo "业务层 ✅"
+
+          echo "---- 不留副本（v16.3 核心：导入覆盖、移出即丢）----"
+          grep -q "lsCopyIntoLibrary" Sources/Store.swift || { echo "::error::没有入库逻辑"; exit 1; }
+          grep -q "func clearLibrary" Sources/Store.swift || { echo "::error::没有清空我的包"; exit 1; }
+          grep -q "static func trashDir" Sources/LSPaths.swift || { echo "::error::没有一次性回收站"; exit 1; }
+          grep -q "static func discard" Sources/LSPaths.swift || { echo "::error::没有丢弃函数"; exit 1; }
+          grep -q "static func purgeTrash" Sources/LSPaths.swift || { echo "::error::没有回收站清空"; exit 1; }
+          grep -q "LSPaths.discard(f.url)" Sources/Store.swift || { echo "::error::导入成功后没丢掉 App 里那份副本"; exit 1; }
+          grep -q "LSPaths.trashDir()" Sources/Store.swift || { echo "::error::移出后没直接丢掉"; exit 1; }
+          grep -q "sweepTrash" Sources/Store.swift || { echo "::error::没有后台清回收站"; exit 1; }
+          grep -q "renameOver" Sources/DirectBridge.swift || { echo "::error::覆盖写盘不再是 rename 原子替换"; exit 1; }
+          if grep -q "库里那份保留" Sources/Store.swift; then
+            echo "::error::导入流程还写着「库里那份保留」——这版要求两头都不留"; exit 1
+          fi
+          if grep -q "包放一次就常驻" Sources/ContentView.swift; then
+            echo "::error::界面还写着「包放一次就常驻」"; exit 1
+          fi
+          if grep -q "LSPaths.outDir()" Sources/Store.swift; then
+            echo "::error::移出还往「已移出」留一份——这版要求移出后删掉"; exit 1
+          fi
+          grep -q "两头都不留副本" Sources/ContentView.swift || { echo "::error::界面没写清这版不保留"; exit 1; }
+          echo "不留副本 ✅"
+
+          echo "---- 界面 ----"
+          grep -q "导入文件" Sources/ContentView.swift || { echo "::error::没有「导入文件」按钮"; exit 1; }
+          grep -q "移出导入的文件" Sources/ContentView.swift || { echo "::error::没有「移出导入的文件」"; exit 1; }
+          grep -q "struct ExportPicker" Sources/ContentView.swift || { echo "::error::没有系统存储面板"; exit 1; }
+          grep -q "relayCard" Sources/ContentView.swift || { echo "::error::没有接力面板"; exit 1; }
+          grep -q "添加文件" Sources/ContentView.swift || { echo "::error::没有「添加文件」"; exit 1; }
+          echo "---- 路径记忆 ----"
+          grep -q "enum PathMemory" Sources/PathMemory.swift || { echo "::error::PathMemory 模块丢了"; exit 1; }
+          grep -q "ShadowTrackerExtra" Sources/PathMemory.swift || { echo "::error::路径补全特征串丢了"; exit 1; }
+          grep -q "static func complete" Sources/PathMemory.swift || { echo "::error::没有路径补全"; exit 1; }
+          grep -q "static func fromClipboard" Sources/PathMemory.swift || { echo "::error::没有剪贴板读取"; exit 1; }
+          grep -q "func rememberPaksPath" Sources/Store.swift || { echo "::error::记住路径的逻辑丢了"; exit 1; }
+          grep -q "func refreshPathNote" Sources/Store.swift || { echo "::error::记忆状态刷新丢了"; exit 1; }
+          grep -q "func clearPaksPath" Sources/Store.swift || { echo "::error::清除路径记忆丢了"; exit 1; }
+          grep -q "fallbackHome" Sources/FilzaLink.swift || { echo "::error::Filza 跳转没有回落首页"; exit 1; }
+          grep -q "记住" Sources/ContentView.swift || { echo "::error::界面上没有「记住」按钮"; exit 1; }
+          grep -q "pathRemembered" Sources/ContentView.swift || { echo "::error::界面没有记忆状态显示"; exit 1; }
+          echo "路径记忆 ✅"
+
+          echo "界面 ✅"
+
+          echo "---- 工程配置 ----"
+          grep -q 'CFBundleShortVersionString: "16\.3' project.yml || { echo "::error::版本号不是 16.3"; exit 1; }
+          grep -q "com.langshen.zakamove15" project.yml || { echo "::error::包标识变了，会和旧版打架"; exit 1; }
+          grep -q "LSApplicationQueriesSchemes" project.yml || { echo "::error::没登记 filza 的跳转白名单"; exit 1; }
+          grep -q "UIFileSharingEnabled: true" project.yml || { echo "::error::没开文件共享，文件 App 里看不到中转站"; exit 1; }
+          echo "配置 ✅"
+
+          echo "---- 生成工程 ----"
+          xcodegen generate
+          ls -la
+          xcodebuild -list -project LSPakManager.xcodeproj
+
+      - name: 6 编译
+        env:
+          SRC_ROOT: ${{ steps.locate.outputs.root }}
+        run: |
+          cd "$SRC_ROOT"
+          set +e
+          xcodebuild \
+            -project LSPakManager.xcodeproj \
+            -scheme LSPakManager \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            build > /tmp/build.log 2>&1
+          RC=$?
+          echo "xcodebuild 退出码 = $RC"
+          echo "=================================================="
+          echo "报错行（error: / fatal error 开头）"
+          echo "=================================================="
+          grep -nE "error:|fatal error|BUILD FAILED|The following build commands failed|undefined symbol|ld: " /tmp/build.log | head -60
+          echo "=================================================="
+          echo "日志最后 40 行"
+          echo "=================================================="
+          tail -n 40 /tmp/build.log
+          if [ "$RC" -ne 0 ]; then
+            {
+              echo ""
+              echo "## ❌ 编译失败，原文在这（v16.3）"
+              echo ""
+              echo '```'
+              grep -nE "error:|fatal error" /tmp/build.log | head -30
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          n=0
+          grep -E "error:|fatal error" /tmp/build.log | head -8 | while IFS= read -r line; do
+            n=$((n+1))
+            if [ "$n" -le 5 ]; then
+              safe=$(printf '%s' "$line" | sed 's/%/%25/g')
+              echo "::error::编译报错 → $safe"
+            fi
+          done
+          exit $RC
+
+      - name: 7 打包成 ipa
+        id: pack
+        env:
+          SRC_ROOT: ${{ steps.locate.outputs.root }}
+        run: |
+          set -eu
+          cd "$SRC_ROOT"
+          APP=$(find build/Build/Products -maxdepth 3 -type d -name "*.app" | head -n 1 || true)
+          echo "APP = [$APP]"
+          if [ -z "$APP" ]; then
+            echo "::error::没找到 .app"
+            find build -maxdepth 4 -type d | head -n 40 || true
+            exit 1
+          fi
+          APPNAME=$(basename "$APP")
+          EXEC=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist" 2>/dev/null || true)
+          if [ -z "${EXEC:-}" ]; then EXEC="${APPNAME%.app}"; fi
+          echo "APPNAME = [$APPNAME]  主程序 = [$EXEC]"
+
+          rm -rf Payload LSPakManager-v16-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" "Payload/$APPNAME"
+          lipo -info "Payload/$APPNAME/$EXEC" 2>/dev/null || file "Payload/$APPNAME/$EXEC"
+
+          if zip -qry LSPakManager-v16-unsigned.ipa Payload; then
+            echo "打包方式：zip ✅"
+          else
+            rm -f LSPakManager-v16-unsigned.ipa
+            /usr/bin/ditto -c -k --sequesterRsrc --keepParent Payload LSPakManager-v16-unsigned.ipa
+            echo "打包方式：ditto ✅"
+          fi
+
+          ls -l LSPakManager-v16-unsigned.ipa
+          SIZE=$(stat -f%z LSPakManager-v16-unsigned.ipa)
+          if [ "$SIZE" -lt 300000 ]; then
+            echo "::error::ipa 只有 $SIZE 字节，明显不对"
+            exit 1
+          fi
+          unzip -t LSPakManager-v16-unsigned.ipa | tail -n 4
+
+          LISTING=$(unzip -l LSPakManager-v16-unsigned.ipa)
+          printf '%s\n' "$LISTING" | grep -q "Payload/$APPNAME/Info.plist" || { echo "::error::结构错：没有 Info.plist"; exit 1; }
+          printf '%s\n' "$LISTING" | grep -q "Payload/$APPNAME/$EXEC"     || { echo "::error::结构错：没有主程序"; exit 1; }
+          echo "✅ ipa 结构正确"
+
+          SHA=$(shasum -a 256 LSPakManager-v16-unsigned.ipa | awk '{print $1}')
+          printf '%s  LSPakManager-v16-unsigned.ipa\n' "$SHA" > LSPakManager-ipa.sha256
+          {
+            echo "sha=$SHA"
+            echo "size=$SIZE"
+            echo "appname=$APPNAME"
+            echo "exec=$EXEC"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 8 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: LSPakManager-ipa-v16
+          path: |
+            ${{ steps.locate.outputs.root }}/LSPakManager-v16-unsigned.ipa
+            ${{ steps.locate.outputs.root }}/LSPakManager-ipa.sha256
+          retention-days: 30
+
+      - name: 9 发布成可直接下载的 ipa 链接
+        id: rel
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ipa-latest
+          name: 最新 ipa（自动构建）
+          body: |
+            构建号：${{ github.run_number }}
+            版本：16.3（导入覆盖原件 / 移出即丢，两头不留副本）
+            SHA256：${{ steps.pack.outputs.sha }}
+
+            未签名包，导入全能签后勾「重签所有框架」再签。
+          files: |
+            ${{ steps.locate.outputs.root }}/LSPakManager-v16-unsigned.ipa
+          overwrite_files: true
+          make_latest: true
+
+      - name: 10 运行页写出直链
+        if: success()
+        run: |
+          set +e
+          URL="https://github.com/${{ github.repository }}/releases/download/ipa-latest/LSPakManager-v16-unsigned.ipa"
+          AURL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          {
+            echo "## ✅ ipa 直链（点开直接下真 ipa）"
+            echo ""
+            echo "$URL"
+            echo ""
+            echo "- 版本：16.3"
+            echo "- 大小：${{ steps.pack.outputs.size }} 字节"
+            echo "- SHA256：\`${{ steps.pack.outputs.sha }}\`"
+            echo ""
+            echo "## 📦 Artifacts 备用（这个是 zip，要先解压）"
+            echo ""
+            echo "$AURL"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "ipa 直链 = $URL"
+
+      - name: 11 失败时把错误原文写回仓库
+        if: failure()
+        env:
+          SRC_ROOT: ${{ steps.locate.outputs.root }}
+        run: |
+          set +e
+          {
+            echo "# 编译错误原文（v16.3）"
+            echo ""
+            echo "- 时间: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo ""
+            if [ -f /tmp/build.log ]; then
+              echo "## 一、error 行"
+              echo '```'
+              grep -nE "error:|fatal error|BUILD FAILED|The following build commands failed|undefined symbol|ld: |clang: error" /tmp/build.log | head -200
+              echo '```'
+              echo ""
+              echo "## 二、日志最后 150 行"
+              echo '```'
+              tail -n 150 /tmp/build.log
+              echo '```'
+            else
+              echo "没跑到编译就停了（多半是没找到 v16 源码）。"
+            fi
+          } > BUILD-ERROR.txt
+          sed -n '1,30p' BUILD-ERROR.txt
+          git config user.name "zaka-build-bot"
+          git config user.email "build-bot@users.noreply.github.com"
+          git add -f BUILD-ERROR.txt
+          git commit -m "记录编译错误 [skip ci]" || true
+          git push origin "HEAD:${GITHUB_REF_NAME}" || echo "::warning::写回仓库失败"
