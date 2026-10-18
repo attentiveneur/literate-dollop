@@ -12,28 +12,67 @@ jobs:
       - name: 拉代码
         uses: actions/checkout@v4
 
-      - name: 解压源码包
+      - name: 选源码包并解压
+        id: pick
         shell: bash
         run: |
           set -e
-          echo "仓库根目录内容："
+          echo "===== 仓库根目录内容 ====="
           ls -la
+          echo "=========================="
+          echo "----- workflows 目录 -----"
+          ls -la .github/workflows || true
+          echo "--------------------------"
+
+          # 根目录里可能躺着好几个源码包（上一轮就是因为"谁排前面用谁"编了旧的 v1.2.1）。
+          # 现在的做法：优先 v1.2.4，其余按名字倒序；而且每个包都要先验证代码是不是新的，
+          # 旧包直接跳过，绝不再拿旧代码编译。
+          ZIPS=$(ls -1 2>/dev/null | grep -E '^3105-Source-.*\.zip$' || true)
+          echo "根目录发现的 3105 源码包："
+          echo "${ZIPS:-  （一个都没有）}"
+
+          CANDIDATES="3105-Source-v1.2.4.zip"
+          if [ -n "$ZIPS" ]; then
+            for f in $(printf '%s\n' "$ZIPS" | sort -r); do
+              CANDIDATES="$CANDIDATES $f"
+            done
+          fi
+
           ZIP=""
-          for f in *.zip; do
-            [ -e "$f" ] || continue
-            if unzip -l "$f" 2>/dev/null | grep -q "\.xcodeproj/"; then
+          for f in $CANDIDATES; do
+            [ -f "$f" ] || continue
+            if ! unzip -l "$f" 2>/dev/null | grep -q "\.xcodeproj/"; then
+              echo "跳过 $f：里面没有 .xcodeproj"
+              continue
+            fi
+            rm -rf /tmp/srcchk && mkdir -p /tmp/srcchk
+            unzip -q -o "$f" -d /tmp/srcchk
+            UTILS=$(find /tmp/srcchk -name "Utils.swift" | head -1)
+            CV=$(find /tmp/srcchk -name "ContentView.swift" | head -1)
+            if grep -q "enum PatchAudioFeedback" "$UTILS" 2>/dev/null && grep -q "func ingestExternal" "$CV" 2>/dev/null; then
               ZIP="$f"
               break
             fi
+            echo "跳过 $f：这是旧代码（缺本次修复），不用它编译"
           done
+
           if [ -z "$ZIP" ]; then
-            echo "::error::仓库根目录没有找到包含 .xcodeproj 的 zip 源码包，把 3105-Source-v1.2.3.zip 原样传到根目录"
+            echo "::error::根目录里没有一个可用的新源码包，请把 3105-Source-v1.2.4.zip 原样传到根目录，并把旧的 3105 zip 删掉"
             exit 1
           fi
-          echo "使用源码包: $ZIP"
-          unzip -q -o "$ZIP"
-          echo "解压后："
-          ls -la
+
+          echo ">>> 本次使用的源码包：$ZIP"
+          echo "zip_name=$ZIP" >> "$GITHUB_OUTPUT"
+
+          rm -rf /tmp/srcchk && mkdir -p /tmp/srcchk
+          unzip -q -o "$ZIP" -d /tmp/srcchk
+          cp -R /tmp/srcchk/. .
+
+          VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" ThreeOneOSFive/Info.plist 2>/dev/null || echo "?")
+          BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" ThreeOneOSFive/Info.plist 2>/dev/null || echo "?")
+          echo ">>> 准备编译的版本：$VER ($BUILD)"
+          echo "app_version=$VER" >> "$GITHUB_OUTPUT"
+          echo "app_build=$BUILD" >> "$GITHUB_OUTPUT"
 
       - name: 定位工程
         id: locate
@@ -59,6 +98,8 @@ jobs:
         run: |
           set -o pipefail
           PROJ="${{ steps.locate.outputs.project }}"
+          echo "源码包 = ${{ steps.pick.outputs.zip_name }}"
+          echo "版本   = ${{ steps.pick.outputs.app_version }} (${{ steps.pick.outputs.app_build }})"
           LIST=$(xcodebuild -project "$PROJ" -list 2>&1 || true)
           SCHEME=$(echo "$LIST" | awk '/Schemes:/{f=1;next} /Targets:/{f=0} f&&NF{print $1; exit}')
           TARGET=$(echo "$LIST" | awk '/Targets:/{f=1;next} /Build Configurations:/{f=0} f&&NF{print $1; exit}')
@@ -94,19 +135,29 @@ jobs:
           fi
 
           if [ "$STATUS" -ne 0 ]; then
+            ERRCOUNT=$(grep -c -i "error:" build.log || true)
             echo ""
-            echo "=========== 报错行（把这段截图发我） ==========="
-            grep -n -i -B3 -A8 "error:" build.log | head -200
-            echo "----------- 失败的命令 -----------"
-            sed -n '/The following build commands failed/,/^$/p' build.log | head -40
-            echo "----------- 日志最后 60 行 -----------"
-            tail -60 build.log
+            echo "=========== 失败信息 ==========="
+            echo "源码包: ${{ steps.pick.outputs.zip_name }}"
+            echo "版本:   ${{ steps.pick.outputs.app_version }}"
+            echo "报错条数: $ERRCOUNT"
+            echo ""
+            echo "----- error: 全部行（带行号）-----"
+            grep -n -i "error:" build.log | head -80 || true
+            echo ""
+            echo "----- error: 前后各 6 行 -----"
+            grep -n -i -B6 -A12 "error:" build.log | head -300 || true
+            echo ""
+            echo "----- 失败的命令 -----"
+            sed -n '/The following build commands failed/,/failures)/p' build.log | head -40 || true
+            echo ""
+            echo "----- 日志最后 80 行 -----"
+            tail -80 build.log || true
             echo "=============================================="
-            echo "::error::编译失败，看上面「报错行」"
+            echo "::error::编译失败：源码包 ${{ steps.pick.outputs.zip_name }}，报错 $ERRCOUNT 条，看上面「error: 全部行」"
             exit 1
           fi
           echo ">>> 编译通过"
-          find "$PWD/dd/Build/Products" -maxdepth 2 -name "*.app" -type d
 
       - name: 失败时上传编译日志
         if: failure()
@@ -117,6 +168,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: 打 unsigned IPA
+        id: pack
         shell: bash
         run: |
           set -e
@@ -124,24 +176,28 @@ jobs:
           echo "APP=$APP"
           if [ -z "$APP" ]; then echo "::error::没找到 .app"; exit 1; fi
           NAME=$(basename "$APP" .app)
+          IPA="langshen-pak-v${{ steps.pick.outputs.app_version }}-unsigned.ipa"
           rm -rf build && mkdir -p build/Payload
           cp -R "$APP" build/Payload/
           /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $NAME" "build/Payload/$(basename "$APP")/Info.plist" || true
           cd build
-          /usr/bin/zip -qry "langshen-pak-v1.2.3-unsigned.ipa" Payload
+          /usr/bin/zip -qry "$IPA" Payload
           rm -rf Payload
-          ls -lh langshen-pak-v1.2.3-unsigned.ipa
+          ls -lh "$IPA"
+          echo "ipa_name=$IPA" >> "$GITHUB_OUTPUT"
 
       - name: 上传成品
         uses: actions/upload-artifact@v4
         with:
-          name: langshen-pak-v1.2.3-unsigned
-          path: build/langshen-pak-v1.2.3-unsigned.ipa
+          name: langshen-pak-v${{ steps.pick.outputs.app_version }}-unsigned
+          path: build/langshen-pak-v${{ steps.pick.outputs.app_version }}-unsigned.ipa
           if-no-files-found: error
 
       - name: 输出直链
         shell: bash
         run: |
           echo "✅ 编好了，就在本页最下面 Artifacts"
+          echo "源码包: ${{ steps.pick.outputs.zip_name }}"
+          echo "版本:   ${{ steps.pick.outputs.app_version }} (${{ steps.pick.outputs.app_build }})"
           echo "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "下载 langshen-pak-v1.2.3-unsigned → 用全能签重签（勾「重签所有框架」）"
+          echo "下载 langshen-pak-v${{ steps.pick.outputs.app_version }}-unsigned → 用全能签重签（勾「重签所有框架」）"
