@@ -1,11 +1,11 @@
-name: Build 浪神文件管理器 IPA
+name: 构建浪神文件管理器 IPA
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
 
     steps:
@@ -13,67 +13,135 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 解压源码包
+        shell: bash
         run: |
           set -e
-          ZIP=$(ls -1 *.zip | head -1)
-          echo "找到源码包: $ZIP"
+          echo "仓库根目录内容："
+          ls -la
+          ZIP=""
+          for f in *.zip; do
+            [ -e "$f" ] || continue
+            if unzip -l "$f" 2>/dev/null | grep -q "\.xcodeproj/"; then
+              ZIP="$f"
+              break
+            fi
+          done
+          if [ -z "$ZIP" ]; then
+            echo "::error::仓库根目录没有找到包含 .xcodeproj 的 zip 源码包，把 3105-Source-v1.2.3.zip 原样传到根目录"
+            exit 1
+          fi
+          echo "使用源码包: $ZIP"
           unzip -q -o "$ZIP"
+          echo "解压后："
           ls -la
 
       - name: 定位工程
         id: locate
+        shell: bash
         run: |
           set -e
-          PROJ=$(find . -maxdepth 3 -name "*.xcodeproj" -type d | head -1)
-          if [ -z "$PROJ" ]; then echo "没找到 .xcodeproj"; exit 1; fi
+          PROJ=$(find . -maxdepth 3 -name "ThreeOneOSFive.xcodeproj" -type d | head -1)
+          if [ -z "$PROJ" ]; then
+            PROJ=$(find . -maxdepth 3 -name "*.xcodeproj" -type d | head -1)
+          fi
+          if [ -z "$PROJ" ]; then
+            echo "::error::没找到 .xcodeproj，源码包没解开或者包不对"
+            exit 1
+          fi
           echo "project=$PROJ" >> "$GITHUB_OUTPUT"
-          DIR=$(dirname "$PROJ")
-          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
           echo "工程: $PROJ"
+          xcodebuild -version
+          echo "----- 工程里有哪些 target / scheme -----"
+          xcodebuild -project "$PROJ" -list 2>&1 || true
 
       - name: 编译（不签名）
+        shell: bash
         run: |
-          set -e
+          set -o pipefail
           PROJ="${{ steps.locate.outputs.project }}"
-          SCHEME=$(xcodebuild -project "$PROJ" -list -json | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['project']['schemes'][0])")
-          echo "Scheme: $SCHEME"
-          xcodebuild \
-            -project "$PROJ" \
-            -scheme "$SCHEME" \
-            -configuration Release \
-            -sdk iphoneos \
-            -archivePath "$PWD/build/app.xcarchive" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            archive
+          LIST=$(xcodebuild -project "$PROJ" -list 2>&1 || true)
+          SCHEME=$(echo "$LIST" | awk '/Schemes:/{f=1;next} /Targets:/{f=0} f&&NF{print $1; exit}')
+          TARGET=$(echo "$LIST" | awk '/Targets:/{f=1;next} /Build Configurations:/{f=0} f&&NF{print $1; exit}')
+          [ -z "$TARGET" ] && TARGET="OGIOS"
+          echo "Scheme=[$SCHEME]  Target=[$TARGET]"
+
+          COMMON=(
+            -project "$PROJ"
+            -configuration Release
+            -sdk iphoneos
+            -derivedDataPath "$PWD/dd"
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=""
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=NO
+            GCC_TREAT_WARNINGS_AS_ERRORS=NO
+          )
+
+          set +e
+          if [ -n "$SCHEME" ]; then
+            echo ">>> 用 scheme 编译: $SCHEME"
+            xcodebuild "${COMMON[@]}" -scheme "$SCHEME" build 2>&1 | tee build.log
+            STATUS=${PIPESTATUS[0]}
+            if [ "$STATUS" -ne 0 ] && grep -q "does not contain a scheme" build.log; then
+              echo ">>> scheme 没认到，改用 target 编译"
+              xcodebuild "${COMMON[@]}" -target "$TARGET" build 2>&1 | tee build.log
+              STATUS=${PIPESTATUS[0]}
+            fi
+          else
+            echo ">>> 没有 scheme，用 target 编译: $TARGET"
+            xcodebuild "${COMMON[@]}" -target "$TARGET" build 2>&1 | tee build.log
+            STATUS=${PIPESTATUS[0]}
+          fi
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo ""
+            echo "=========== 报错行（把这段截图发我） ==========="
+            grep -n -i -B3 -A8 "error:" build.log | head -200
+            echo "----------- 失败的命令 -----------"
+            sed -n '/The following build commands failed/,/^$/p' build.log | head -40
+            echo "----------- 日志最后 60 行 -----------"
+            tail -60 build.log
+            echo "=============================================="
+            echo "::error::编译失败，看上面「报错行」"
+            exit 1
+          fi
+          echo ">>> 编译通过"
+          find "$PWD/dd/Build/Products" -maxdepth 2 -name "*.app" -type d
+
+      - name: 失败时上传编译日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: 打 unsigned IPA
-        id: ipa
+        shell: bash
         run: |
           set -e
-          APP=$(find build/app.xcarchive/Products/Applications -maxdepth 1 -name "*.app" -type d | head -1)
+          APP=$(find "$PWD/dd/Build/Products" -maxdepth 2 -name "*.app" -type d | head -1)
           echo "APP=$APP"
-          if [ -z "$APP" ]; then echo "没找到 .app"; exit 1; fi
+          if [ -z "$APP" ]; then echo "::error::没找到 .app"; exit 1; fi
           NAME=$(basename "$APP" .app)
-          mkdir -p build/Payload
+          rm -rf build && mkdir -p build/Payload
           cp -R "$APP" build/Payload/
           /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $NAME" "build/Payload/$(basename "$APP")/Info.plist" || true
           cd build
-          /usr/bin/zip -qry "langshen-pak-v1.2.1-unsigned.ipa" Payload
+          /usr/bin/zip -qry "langshen-pak-v1.2.3-unsigned.ipa" Payload
           rm -rf Payload
-          ls -lh langshen-pak-v1.2.1-unsigned.ipa
-          echo "ipa=$PWD/langshen-pak-v1.2.1-unsigned.ipa" >> "$GITHUB_OUTPUT"
+          ls -lh langshen-pak-v1.2.3-unsigned.ipa
 
       - name: 上传成品
         uses: actions/upload-artifact@v4
         with:
-          name: langshen-pak-v1.2.1-unsigned
-          path: build/langshen-pak-v1.2.1-unsigned.ipa
+          name: langshen-pak-v1.2.3-unsigned
+          path: build/langshen-pak-v1.2.3-unsigned.ipa
           if-no-files-found: error
 
       - name: 输出直链
+        shell: bash
         run: |
-          echo "✅ ipa 直链"
+          echo "✅ 编好了，就在本页最下面 Artifacts"
           echo "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "页面最下面 Artifacts → langshen-pak-v1.2.1-unsigned 下载"
+          echo "下载 langshen-pak-v1.2.3-unsigned → 用全能签重签（勾「重签所有框架」）"
